@@ -1,5 +1,6 @@
 #include <Wire.h>
 #include <Adafruit_PWMServoDriver.h>
+#include <WiFi.h>
 
 // Serial protocol (lines):
 //   M,<id>,<pulse>   -> move servo id (0-15) to raw PCA9685 tick pulse
@@ -8,6 +9,15 @@
 //   DUR,<ms>         -> set default POSE motion duration
 //   SPD,<percent>    -> set motion speed percentage (1-100)
 //   ESTOP            -> disable all outputs (sets all channels off)
+// Same line protocol is accepted via WiFi TCP on WIFI_PORT.
+
+// WiFi settings (update to your network)
+static const char* WIFI_SSID = "Mr Samosa";
+static const char* WIFI_PASS = "whoknows?";
+static const uint16_t WIFI_PORT = 5000;
+
+WiFiServer tcpServer(WIFI_PORT);
+WiFiClient tcpClient;
 
 Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver(0x40);
 
@@ -66,6 +76,14 @@ static const uint8_t STARTUP_SIT_ANGLES[SERVO_COUNT] = {
 };
 
 String lineBuffer;
+String wifiLineBuffer;
+
+void sendReply(const String &msg) {
+  Serial.println(msg);
+  if (tcpClient && tcpClient.connected()) {
+    tcpClient.println(msg);
+  }
+}
 
 void writeServo(uint8_t channel, uint16_t pulse) {
   if (channel >= SERVO_COUNT) return;
@@ -227,14 +245,34 @@ void setup() {
     writeServo(i, zeroPulse);
   }
   applyStartupSitPose();
-  Serial.println("READY");
+
+  if (WIFI_SSID != nullptr && WIFI_SSID[0] != '\0') {
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+    uint32_t start = millis();
+    while (WiFi.status() != WL_CONNECTED && (millis() - start) < 10000) {
+      delay(200);
+      Serial.print('.');
+    }
+    if (WiFi.status() == WL_CONNECTED) {
+      tcpServer.begin();
+      Serial.print("WIFI_OK,");
+      Serial.print(WiFi.localIP());
+      Serial.print(",PORT,");
+      Serial.println(WIFI_PORT);
+    } else {
+      Serial.println("WIFI_ERR");
+    }
+  }
+
+  sendReply("READY");
 }
 
 void handleLine(const String &line) {
   if (line == "ESTOP") {
     isMoving = false;
     emergencyStop();
-    Serial.println("ESTOP_OK");
+    sendReply("ESTOP_OK");
     return;
   }
 
@@ -242,12 +280,11 @@ void handleLine(const String &line) {
     float poseAngles[LOGICAL_JOINT_COUNT];
     uint16_t duration = defaultMotionDurationMs;
     if (!parsePoseCommand(line, poseAngles, duration)) {
-      Serial.println("POSE_ERR");
+      sendReply("POSE_ERR");
       return;
     }
     startPoseMotion(poseAngles, duration);
-    Serial.print("POSE_OK,");
-    Serial.println(duration);
+    sendReply(String("POSE_OK,") + String(duration));
     return;
   }
 
@@ -256,8 +293,7 @@ void handleLine(const String &line) {
     if (first < 0) return;
     int value = line.substring(first + 1).toInt();
     defaultMotionDurationMs = (uint16_t)constrain(value, (int)MIN_MOTION_DURATION_MS, (int)MAX_MOTION_DURATION_MS);
-    Serial.print("DUR_OK,");
-    Serial.println(defaultMotionDurationMs);
+    sendReply(String("DUR_OK,") + String(defaultMotionDurationMs));
     return;
   }
 
@@ -270,16 +306,13 @@ void handleLine(const String &line) {
     writeMappedServo(id, pulse);
     uint8_t channel = mappedChannel(id);
     uint16_t constrainedPulse = constrain(pulse, SERVO_MIN, SERVO_MAX);
-    Serial.print("M_OK,");
-    Serial.print(id);
-    Serial.print(",");
-    Serial.print(constrainedPulse);
-    Serial.print(",CH,");
+    String msg = String("M_OK,") + String(id) + "," + String(constrainedPulse) + ",CH,";
     if (channel < SERVO_COUNT) {
-      Serial.println(channel);
+      msg += String(channel);
     } else {
-      Serial.println("NA");
+      msg += "NA";
     }
+    sendReply(msg);
     return;
   }
 
@@ -291,10 +324,7 @@ void handleLine(const String &line) {
     uint8_t idx = (uint8_t)line.substring(second + 1).toInt();
     if (id >= SERVO_COUNT || idx >= SERVO_COUNT) return;
     motorMap[id] = idx;
-    Serial.print("IDX_OK,");
-    Serial.print(id);
-    Serial.print(",");
-    Serial.println(idx);
+    sendReply(String("IDX_OK,") + String(id) + "," + String(idx));
     return;
   }
 
@@ -304,28 +334,52 @@ void handleLine(const String &line) {
     int value = line.substring(first + 1).toInt();
     speedPercent = (uint8_t)constrain(value, 1, 100);
     defaultMotionDurationMs = (uint16_t)constrain((int)(DEFAULT_MOTION_DURATION_MS * (100.0f / speedPercent)), (int)MIN_MOTION_DURATION_MS, (int)MAX_MOTION_DURATION_MS);
-    Serial.print("SPD_OK,");
-    Serial.println(speedPercent);
+    sendReply(String("SPD_OK,") + String(speedPercent));
     return;
   }
 }
 
-void loop() {
-  while (Serial.available() > 0) {
-    char c = (char)Serial.read();
+void consumeChars(Stream &stream, String &buffer) {
+  while (stream.available() > 0) {
+    char c = (char)stream.read();
     if (c == '\n' || c == '\r') {
-      if (lineBuffer.length() > 0) {
-        handleLine(lineBuffer);
-        lineBuffer = "";
+      if (buffer.length() > 0) {
+        handleLine(buffer);
+        buffer = "";
       }
     } else {
-      if (lineBuffer.length() < 64) {
-        lineBuffer += c;
+      if (buffer.length() < 96) {
+        buffer += c;
       } else {
-        lineBuffer = "";
+        buffer = "";
       }
     }
   }
+}
+
+void pollWifiClient() {
+  if (!tcpServer) return;
+
+  if (!tcpClient || !tcpClient.connected()) {
+    WiFiClient incoming = tcpServer.available();
+    if (incoming) {
+      if (tcpClient) {
+        tcpClient.stop();
+      }
+      tcpClient = incoming;
+      wifiLineBuffer = "";
+      sendReply("WIFI_CLIENT_OK");
+    }
+  }
+
+  if (tcpClient && tcpClient.connected()) {
+    consumeChars(tcpClient, wifiLineBuffer);
+  }
+}
+
+void loop() {
+  consumeChars(Serial, lineBuffer);
+  pollWifiClient();
 
   updateMotion();
 }

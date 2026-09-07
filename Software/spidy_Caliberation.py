@@ -3,6 +3,9 @@ import time
 import os
 import json
 import math
+import socket
+import ipaddress
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 
 from PyQt5 import QtCore, QtGui, QtWidgets
@@ -69,12 +72,22 @@ class SerialManager(QtCore.QObject):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._ser = None
+        self._tcp = None
+        self._tcp_rx_buffer = ""
+        self._mode = None
         self._reader = QtCore.QTimer(self)
         self._reader.setInterval(20)
         self._reader.timeout.connect(self._read_loop)
 
     def is_connected(self):
-        return self._ser is not None and self._ser.is_open
+        if self._mode == "serial":
+            return self._ser is not None and self._ser.is_open
+        if self._mode == "wifi":
+            return self._tcp is not None
+        return False
+
+    def mode(self):
+        return self._mode
 
     def available_ports(self):
         if serial is None:
@@ -82,16 +95,36 @@ class SerialManager(QtCore.QObject):
         return [p.device for p in serial.tools.list_ports.comports()]
 
     def connect_port(self, port, baud=115200):
+        if self.is_connected():
+            self.disconnect_port()
         if serial is None:
             self.error.emit("pyserial not installed.")
             return
         try:
             self._ser = serial.Serial(port=port, baudrate=baud, timeout=0.01)
+            self._mode = "serial"
             time.sleep(0.2)
             self._reader.start()
             self.connected.emit(port)
         except Exception as exc:
             self._ser = None
+            self._mode = None
+            self.error.emit(str(exc))
+
+    def connect_wifi(self, host, port, timeout_sec=2.0):
+        if self.is_connected():
+            self.disconnect_port()
+        try:
+            sock = socket.create_connection((host, int(port)), timeout=timeout_sec)
+            sock.setblocking(False)
+            self._tcp = sock
+            self._tcp_rx_buffer = ""
+            self._mode = "wifi"
+            self._reader.start()
+            self.connected.emit(f"{host}:{int(port)}")
+        except Exception as exc:
+            self._tcp = None
+            self._mode = None
             self.error.emit(str(exc))
 
     def disconnect_port(self):
@@ -101,30 +134,156 @@ class SerialManager(QtCore.QObject):
                 self._ser.close()
             except Exception:
                 pass
+        if self._tcp is not None:
+            try:
+                self._tcp.close()
+            except Exception:
+                pass
         self._ser = None
+        self._tcp = None
+        self._tcp_rx_buffer = ""
+        self._mode = None
         self.disconnected.emit()
 
     def send_line(self, line):
         if not self.is_connected():
             return
         try:
-            self._ser.write((line.strip() + "\n").encode("utf-8"))
+            payload = (line.strip() + "\n").encode("utf-8")
+            if self._mode == "serial" and self._ser is not None:
+                self._ser.write(payload)
+            elif self._mode == "wifi" and self._tcp is not None:
+                self._tcp.sendall(payload)
         except Exception as exc:
             self.error.emit(str(exc))
+            self.disconnect_port()
 
     def _read_loop(self):
         if not self.is_connected():
             return
-        try:
-            data = self._ser.read(512)
-            if not data:
+        if self._mode == "serial":
+            try:
+                data = self._ser.read(512)
+                if not data:
+                    return
+                text = data.decode("utf-8", errors="ignore")
+                for line in text.splitlines():
+                    if line.strip():
+                        self.line_received.emit(line.strip())
+            except Exception as exc:
+                self.error.emit(str(exc))
+                self.disconnect_port()
+            return
+
+        if self._mode == "wifi":
+            if self._tcp is None:
                 return
-            text = data.decode("utf-8", errors="ignore")
-            for line in text.splitlines():
-                if line.strip():
-                    self.line_received.emit(line.strip())
-        except Exception as exc:
-            self.error.emit(str(exc))
+            try:
+                data = self._tcp.recv(2048)
+                if not data:
+                    self.disconnect_port()
+                    return
+                self._tcp_rx_buffer += data.decode("utf-8", errors="ignore")
+                while True:
+                    pos_n = self._tcp_rx_buffer.find("\n")
+                    pos_r = self._tcp_rx_buffer.find("\r")
+                    cut = -1
+                    if pos_n >= 0 and pos_r >= 0:
+                        cut = min(pos_n, pos_r)
+                    elif pos_n >= 0:
+                        cut = pos_n
+                    elif pos_r >= 0:
+                        cut = pos_r
+                    if cut < 0:
+                        break
+                    line = self._tcp_rx_buffer[:cut].strip()
+                    self._tcp_rx_buffer = self._tcp_rx_buffer[cut + 1:]
+                    if line:
+                        self.line_received.emit(line)
+            except BlockingIOError:
+                return
+            except Exception as exc:
+                self.error.emit(str(exc))
+                self.disconnect_port()
+
+
+class WifiDiscoveryWorker(QtCore.QObject):
+    found = QtCore.pyqtSignal(str)
+    status = QtCore.pyqtSignal(str)
+    finished = QtCore.pyqtSignal(list)
+    error = QtCore.pyqtSignal(str)
+
+    def __init__(self, port, timeout_sec=0.2, parent=None):
+        super().__init__(parent)
+        self.port = int(port)
+        self.timeout_sec = float(timeout_sec)
+
+    def _local_ip(self):
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+            s.close()
+            return ip
+        except Exception:
+            pass
+        try:
+            ip = socket.gethostbyname(socket.gethostname())
+            if ip and not ip.startswith("127."):
+                return ip
+        except Exception:
+            pass
+        return None
+
+    def _probe_host(self, ip):
+        sock = None
+        try:
+            sock = socket.create_connection((ip, self.port), timeout=self.timeout_sec)
+            sock.settimeout(self.timeout_sec)
+            try:
+                data = sock.recv(128)
+            except Exception:
+                data = b""
+            if b"WIFI_CLIENT_OK" in data or b"READY" in data:
+                return ip
+            return None
+        except Exception:
+            return None
+        finally:
+            if sock is not None:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+
+    @QtCore.pyqtSlot()
+    def run(self):
+        local_ip = self._local_ip()
+        if not local_ip:
+            self.error.emit("Could not determine local IPv4 address for discovery.")
+            self.finished.emit([])
+            return
+
+        try:
+            net = ipaddress.ip_network(f"{local_ip}/24", strict=False)
+        except Exception:
+            self.error.emit("Could not build local subnet for discovery.")
+            self.finished.emit([])
+            return
+
+        hosts = [str(h) for h in net.hosts()]
+        self.status.emit(f"Scanning {len(hosts)} hosts on port {self.port}...")
+
+        found = []
+        with ThreadPoolExecutor(max_workers=48) as executor:
+            futures = {executor.submit(self._probe_host, ip): ip for ip in hosts}
+            for future in as_completed(futures):
+                ip = future.result()
+                if ip and ip not in found:
+                    found.append(ip)
+                    self.found.emit(ip)
+
+        self.finished.emit(found)
 
 
 class MotorRow(QtWidgets.QWidget):
@@ -576,6 +735,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setWindowTitle(APP_NAME)
         self.resize(1100, 720)
         self.speed_percent = DEFAULT_SPEED_PERCENT
+        self._discover_thread = None
+        self._discover_worker = None
+        self._discover_results = []
 
         self.serial = SerialManager(self)
         self.serial.connected.connect(self._on_connected)
@@ -614,6 +776,29 @@ class MainWindow(QtWidgets.QMainWindow):
         self.toolbar.addAction(self.refresh_btn)
         self.toolbar.addSeparator()
 
+        self.transport_title = QtWidgets.QLabel("Mode:")
+        self.transport_combo = QtWidgets.QComboBox()
+        self.transport_combo.addItems(["Serial", "WiFi"])
+        self.transport_combo.setFixedWidth(90)
+        self.toolbar.addWidget(self.transport_title)
+        self.toolbar.addWidget(self.transport_combo)
+
+        self.ip_title = QtWidgets.QLabel("IP:")
+        self.ip_edit = QtWidgets.QLineEdit("192.168.4.1")
+        self.ip_edit.setFixedWidth(130)
+        self.wifi_port_title = QtWidgets.QLabel("Port:")
+        self.wifi_port_spin = QtWidgets.QSpinBox()
+        self.wifi_port_spin.setRange(1, 65535)
+        self.wifi_port_spin.setValue(5000)
+        self.wifi_port_spin.setFixedWidth(80)
+        self.discover_btn = QtWidgets.QPushButton("Discover")
+        self.discover_btn.setFixedWidth(90)
+        self.toolbar.addWidget(self.ip_title)
+        self.toolbar.addWidget(self.ip_edit)
+        self.toolbar.addWidget(self.wifi_port_title)
+        self.toolbar.addWidget(self.wifi_port_spin)
+        self.toolbar.addWidget(self.discover_btn)
+
         self.speed_title = QtWidgets.QLabel("Speed %:")
         self.speed_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
         self.speed_slider.setRange(1, 100)
@@ -636,6 +821,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_set_all_90.triggered.connect(self._set_all_90)
         self.btn_set_all_cal_90.triggered.connect(self._set_all_cal_90)
         self.refresh_btn.triggered.connect(self._refresh_ports)
+        self.transport_combo.currentTextChanged.connect(self._on_transport_changed)
+        self.discover_btn.clicked.connect(self._start_wifi_discovery)
         self.speed_slider.valueChanged.connect(self._on_speed_slider_changed)
         self.speed_spin.valueChanged.connect(self._on_speed_spin_changed)
         self.btn_set_speed.clicked.connect(self._set_speed)
@@ -655,6 +842,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.poses_tab = PosesTab(self.controller_tab)
         self.tabs.addTab(self.poses_tab, icon, "Poses")
+
+        self.walk_tab = WalkTab(self.controller_tab, self.poses_tab)
+        self.tabs.addTab(self.walk_tab, icon, "Walking")
 
         self.terminal = QtWidgets.QPlainTextEdit()
         self.terminal.setReadOnly(True)
@@ -677,6 +867,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.poses_tab.load_or_create_default_file()
         self._log(f"Default poses file: {self.poses_tab.poses_file_path}")
         self._load_default_calibration()
+        self._on_transport_changed(self.transport_combo.currentText())
 
     def _apply_theme(self):
         self.setStyleSheet("""
@@ -724,19 +915,88 @@ class MainWindow(QtWidgets.QMainWindow):
         self._update_actions()
 
     def _refresh_ports(self):
+        if self.transport_combo.currentText() != "Serial":
+            return
         self.port_combo.clear()
         ports = self.serial.available_ports()
         self.port_combo.addItems(ports if ports else [""])
 
     def _connect(self):
-        port = self.port_combo.currentText().strip()
-        if not port:
-            self._log_error("No COM port selected.")
+        mode = self.transport_combo.currentText()
+        if mode == "Serial":
+            port = self.port_combo.currentText().strip()
+            if not port:
+                self._log_error("No COM port selected.")
+                return
+            self.serial.connect_port(port)
             return
-        self.serial.connect_port(port)
+
+        host = self.ip_edit.text().strip()
+        port = int(self.wifi_port_spin.value())
+        if not host:
+            self._log_error("No IP address entered.")
+            return
+        self.serial.connect_wifi(host, port)
 
     def _disconnect(self):
         self.serial.disconnect_port()
+
+    def _on_transport_changed(self, mode):
+        serial_mode = (mode == "Serial")
+        self.port_combo.setEnabled(serial_mode)
+        self.refresh_btn.setEnabled(serial_mode)
+        self.ip_edit.setEnabled(not serial_mode)
+        self.wifi_port_spin.setEnabled(not serial_mode)
+        self.discover_btn.setEnabled(not serial_mode)
+
+    def _start_wifi_discovery(self):
+        if self._discover_thread is not None:
+            self._log("Discovery already running...")
+            return
+
+        port = int(self.wifi_port_spin.value())
+        self._discover_results = []
+        self.discover_btn.setEnabled(False)
+        self.discover_btn.setText("Scanning...")
+        self._log(f"Starting WiFi discovery on port {port}...")
+
+        self._discover_thread = QtCore.QThread(self)
+        self._discover_worker = WifiDiscoveryWorker(port=port, timeout_sec=0.2)
+        self._discover_worker.moveToThread(self._discover_thread)
+
+        self._discover_thread.started.connect(self._discover_worker.run)
+        self._discover_worker.status.connect(lambda msg: self._log(msg))
+        self._discover_worker.error.connect(self._log_error)
+        self._discover_worker.found.connect(self._on_discovery_found)
+        self._discover_worker.finished.connect(self._on_discovery_finished)
+        self._discover_worker.finished.connect(self._discover_thread.quit)
+        self._discover_thread.finished.connect(self._cleanup_discovery)
+
+        self._discover_thread.start()
+
+    def _on_discovery_found(self, ip):
+        if ip not in self._discover_results:
+            self._discover_results.append(ip)
+            self._log(f"Discovered ESP candidate: {ip}")
+            if not self.ip_edit.text().strip() or self.ip_edit.text().strip() == "192.168.4.1":
+                self.ip_edit.setText(ip)
+
+    def _on_discovery_finished(self, found_list):
+        if found_list:
+            self.ip_edit.setText(found_list[0])
+            self._log(f"Discovery done: {len(found_list)} device(s) found. Using {found_list[0]}")
+        else:
+            self._log("Discovery done: no compatible devices found.")
+
+    def _cleanup_discovery(self):
+        if self._discover_worker is not None:
+            self._discover_worker.deleteLater()
+        if self._discover_thread is not None:
+            self._discover_thread.deleteLater()
+        self._discover_worker = None
+        self._discover_thread = None
+        self.discover_btn.setText("Discover")
+        self._update_actions()
 
     def _estop(self):
         self._send_line("ESTOP")
@@ -772,9 +1032,16 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _update_actions(self):
         connected = self.serial.is_connected()
+        serial_mode = (self.transport_combo.currentText() == "Serial")
         self.btn_connect.setEnabled(not connected)
         self.btn_disconnect.setEnabled(connected)
         self.btn_estop.setEnabled(True)
+        self.transport_combo.setEnabled(not connected)
+        self.port_combo.setEnabled((not connected) and serial_mode)
+        self.refresh_btn.setEnabled((not connected) and serial_mode)
+        self.ip_edit.setEnabled((not connected) and (not serial_mode))
+        self.wifi_port_spin.setEnabled((not connected) and (not serial_mode))
+        self.discover_btn.setEnabled((not connected) and (not serial_mode) and (self._discover_thread is None))
 
     def _load_default_calibration(self):
         base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -1304,6 +1571,175 @@ class PosesTab(QtWidgets.QWidget):
             return True
         self._save_poses()
         return True
+
+
+class WalkTab(QtWidgets.QWidget):
+    def __init__(self, controller: ControllerTab, poses_tab: PosesTab, parent=None):
+        super().__init__(parent)
+        self.controller = controller
+        self.poses_tab = poses_tab
+
+        self._running = False
+        self._frames = []
+        self._cursor = 0
+
+        root = QtWidgets.QVBoxLayout(self)
+        root.setContentsMargins(10, 10, 10, 10)
+        root.setSpacing(10)
+
+        box = QtWidgets.QGroupBox("Hardcoded Walk (Pose 10-13 Reference)")
+        layout = QtWidgets.QGridLayout(box)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setHorizontalSpacing(10)
+        layout.setVerticalSpacing(8)
+
+        self.step_duration_label = QtWidgets.QLabel("Step Duration (ms)")
+        self.step_duration_spin = QtWidgets.QSpinBox()
+        self.step_duration_spin.setRange(100, 5000)
+        self.step_duration_spin.setValue(320)
+
+        self.gap_label = QtWidgets.QLabel("Pause Between Frames (ms)")
+        self.gap_spin = QtWidgets.QSpinBox()
+        self.gap_spin.setRange(0, 1000)
+        self.gap_spin.setValue(50)
+
+        self.btn_start = QtWidgets.QPushButton("Start Walking")
+        self.btn_stop = QtWidgets.QPushButton("Stop")
+        self.status = QtWidgets.QLabel("Idle")
+
+        self.info = QtWidgets.QLabel(
+            "Uses Stand + Pose 10-13 deltas.\n"
+            "Sequence: BL -> FR -> BR -> FL with adjacent hip stabilization."
+        )
+
+        layout.addWidget(self.step_duration_label, 0, 0)
+        layout.addWidget(self.step_duration_spin, 0, 1)
+        layout.addWidget(self.gap_label, 0, 2)
+        layout.addWidget(self.gap_spin, 0, 3)
+        layout.addWidget(self.btn_start, 1, 0, 1, 2)
+        layout.addWidget(self.btn_stop, 1, 2, 1, 2)
+        layout.addWidget(self.status, 2, 0, 1, 4)
+        layout.addWidget(self.info, 3, 0, 1, 4)
+
+        root.addWidget(box)
+        root.addStretch()
+
+        self.btn_start.clicked.connect(self.start_walking)
+        self.btn_stop.clicked.connect(self.stop_walking)
+        self.btn_stop.setEnabled(False)
+
+    def _find_pose_index(self, name):
+        target = name.strip().lower()
+        for i, n in enumerate(self.poses_tab.pose_names):
+            if n.strip().lower() == target:
+                return i
+        return -1
+
+    def _pose_vector(self, pose_name):
+        idx = self._find_pose_index(pose_name)
+        if idx < 0:
+            return None
+        pose = self.poses_tab.pose_angles[idx]
+        return [float(pose[i]) for i in range(MOTOR_COUNT)]
+
+    def _leg_base(self, leg_name):
+        mapping = {
+            "BL": 0,
+            "FL": 3,
+            "FR": 6,
+            "BR": 9,
+        }
+        return mapping[leg_name]
+
+    def _adjacent_leg(self, stepping_leg):
+        mapping = {
+            "BL": "FL",
+            "FL": "BL",
+            "FR": "BR",
+            "BR": "FR",
+        }
+        return mapping[stepping_leg]
+
+    def _copy_leg_delta(self, frame, delta, ref_leg_name, dst_leg_name):
+        ref_base = self._leg_base(ref_leg_name)
+        dst_base = self._leg_base(dst_leg_name)
+        for j in range(3):
+            frame[dst_base + j] += delta[ref_base + j]
+
+    def _build_frames(self):
+        stand = self._pose_vector("Stand")
+        p10 = self._pose_vector("Pose 10")
+        p11 = self._pose_vector("Pose 11")
+        p12 = self._pose_vector("Pose 12")
+        p13 = self._pose_vector("Pose 13")
+
+        if not stand or not p10 or not p11 or not p12 or not p13:
+            return None
+
+        d10 = [p10[i] - stand[i] for i in range(MOTOR_COUNT)]
+        d11 = [p11[i] - stand[i] for i in range(MOTOR_COUNT)]
+        d12 = [p12[i] - stand[i] for i in range(MOTOR_COUNT)]
+        d13 = [p13[i] - stand[i] for i in range(MOTOR_COUNT)]
+        phase_deltas = [d10, d11, d12, d13]
+
+        order = ["BL", "FR", "BR", "FL"]
+        frames = []
+        labels = []
+        for step_leg in order:
+            adj_leg = self._adjacent_leg(step_leg)
+            for phase_i, delta in enumerate(phase_deltas):
+                frame = stand[:]
+                self._copy_leg_delta(frame, delta, "BL", step_leg)
+                self._copy_leg_delta(frame, delta, "FL", adj_leg)
+
+                frame = [max(ANGLE_MIN, min(ANGLE_MAX, int(round(a)))) for a in frame]
+                frames.append(frame)
+                labels.append(f"{step_leg} phase {phase_i + 1}")
+
+        return frames, labels
+
+    def start_walking(self):
+        if self._running:
+            return
+
+        built = self._build_frames()
+        if not built:
+            self.status.setText("Missing required poses: Stand, Pose 10, 11, 12, 13")
+            return
+
+        self._frames, self._labels = built
+        self._cursor = 0
+        self._running = True
+        self.btn_start.setEnabled(False)
+        self.btn_stop.setEnabled(True)
+        self.status.setText("Walking...")
+        self._run_next_frame()
+
+    def stop_walking(self):
+        if not self._running:
+            return
+        self._running = False
+        self.btn_start.setEnabled(True)
+        self.btn_stop.setEnabled(False)
+        self.status.setText("Stopped")
+
+    def _run_next_frame(self):
+        if not self._running:
+            return
+
+        if self._cursor >= len(self._frames):
+            self._cursor = 0
+
+        frame = self._frames[self._cursor]
+        label = self._labels[self._cursor]
+        self._cursor += 1
+
+        duration_ms = int(self.step_duration_spin.value())
+        self.controller.apply_pose_angles(frame, duration_ms=duration_ms)
+        self.status.setText(f"Walking: {label} ({self._cursor}/{len(self._frames)})")
+
+        wait_ms = duration_ms + int(self.gap_spin.value())
+        QtCore.QTimer.singleShot(wait_ms, self._run_next_frame)
 
 
 def main():
